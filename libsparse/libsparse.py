@@ -5,6 +5,7 @@ Sparse matrix library
 
 
 import numpy as np
+import numpy
 import pandas as pd
 import scipy.sparse
 import csv
@@ -41,7 +42,7 @@ class Loc(object):
             
             strs = False
             
-            if isinstance(k, list) or isinstance(k, tuple):
+            if isinstance(k, list) or isinstance(k, numpy.ndarray) or isinstance(k, tuple):
                 for x in k:
                     if isinstance(x, str):
                         strs = True
@@ -62,21 +63,50 @@ class Loc(object):
         
         ix = Loc.get_indices(key[1], self.df.columns)
         iy = Loc.get_indices(key[0], self.df.index)
+        
+        if isinstance(ix, int) and isinstance(iy, int):
+            # If both indexes are ints, return the numerical matrix value
+            return self.df.matrix[iy, ix]
+        
+        index = None
+    
+        if self.df.index is not None:
+            index = self.df.index[iy]
             
-        return SparseDataFrame(self.df.matrix[iy, ix], index=self.df.index[iy], columns=self.df.columns[ix])
+        columns = None
+        
+        if self.df.columns is not None:
+            columns = self.df.columns[ix]
+            
+        # select rows and columns separately since sparse matrices seem to
+        # have an issue doing both at once
+        ret = self.df.matrix[iy, :]
+        ret = ret[:, ix]
+        
+        return SparseDataFrame(ret, index=index, columns=columns)
     
 
 class SparseDataFrame(object):
     def __init__(self, matrix, index=None, columns=None):
+        #print(type(matrix))
+        
         if isinstance(matrix, scipy.sparse.csc.csc_matrix):
             self.__matrix = matrix
-        if isinstance(matrix, scipy.sparse.csr.csr_matrix):
+        elif isinstance(matrix, scipy.sparse.csr.csr_matrix):
             self.__matrix = matrix.tocsc()
+        elif isinstance(matrix, pd.DataFrame):
+            self.__matrix = scipy.sparse.csc.csc_matrix(matrix)
+            
+            if index is None:
+                index = matrix.index
+            
+            if columns is None:
+                columns = matrix.columns
         else:
             self.__matrix = scipy.sparse.csc.csc_matrix(matrix)
         
-        self.index = index
-        self.columns = columns
+        self.__index = index
+        self.__columns = columns
     
     @property    
     def matrix(self):
@@ -115,21 +145,57 @@ class SparseDataFrame(object):
         return Loc(self)
     
     @property
+    def iloc(self):
+        return self.loc
+    
+    @property
     def T(self):
         return self.transpose()
     
+    def todense(self):
+        return self.matrix.todense()
+    
+    def df(self):
+        return pd.DataFrame(self.todense(), index=self.index, columns=self.columns)
 
     def transpose(self):
         return SparseDataFrame(self.matrix.transpose(), index=self.columns, columns=self.index)
     
-    def toarray(self):
-        return self.matrix.toarray()
+    def to_array(self, dtype=None):
+        """
+        Return an array representation of the matrix. If the matrix is one
+        dimensional, the outer dimension is removed so that a 1D array is
+        returned rather than a matrix.
+        """
+        
+        if dtype is not None:
+            print('to_array', dtype)
+            ret = self.matrix.astype(dtype).toarray()
+        else:
+            ret = self.matrix.toarray()
+        
+        if ret.shape[1] == 1:
+            #1D array so transpose
+            ret = ret.T
+            
+        if ret.shape[0] == 1:
+            # Remove outer dimension
+            ret = ret[0]
+        
+        return ret #ret.T
+    
+    def to_list(self):
+        return self.to_array().tolist()
+        
     
     def __getitem__(self, key):
         return self.loc[key]
     
     def remove_empty_rows(self):
         return self[np.where(self.sum(axis=1) > 0)[0],:]
+    
+    def remove_empty_cols(self):
+        return self[:, np.where(self.sum(axis=0) > 0)[0]]
     
     @property
     def array(self):
@@ -161,8 +227,22 @@ class SparseDataFrame(object):
         """
         
         scipy.sparse.save_npz('{}.npz'.format(name), self.matrix, compressed=True)
-        index_to_csv('{}.index.tsv'.format(name), self.index, 'Gene')
-        index_to_csv('{}.columns.tsv'.format(name), self.columns, 'Barcode')
+        index_to_csv('{}.index.tsv'.format(name), self.index, 'row_name')
+        index_to_csv('{}.columns.tsv'.format(name), self.columns, 'column_name')
+        
+    
+    def to_dataframe(self, dtype=None):
+        df = pd.DataFrame(self.to_array(dtype=dtype))
+        df.columns = self.columns
+        df.index = self.index
+        return df
+    
+    
+    def to_csv(self, file, sep='\t', header=True, index=True, dtype=None, compression=None):
+        self.to_dataframe(dtype=dtype).to_csv(file, sep=sep, header=header, index=index, compression=compression)
+        
+    def to_hdf(self, file, key='a'):
+        self.to_dataframe().to_hdf(file, key)
         
         
     def sum(self, axis=0):
@@ -225,6 +305,7 @@ class SparseDataFrame(object):
         
         return SparseDataFrame(m, index=self.index, columns=self.columns)
     
+    
     def log2(self, add=1):
         """
         Log2 all data values.
@@ -243,13 +324,50 @@ class SparseDataFrame(object):
         # copy data
         m = self._copy()
         
-        # inplace add 1
-        np.add(m.data, 1.0, out=m.data)
+        # inplace add 1. Since log2(1) = 0, we can leave all non-existant
+        # i.e. zero values alone because they won't change. We need only
+        # update non-zero values in the matrix
+        np.add(m.data, add, out=m.data)
         
         # in place log2
         np.log2(m.data, out=m.data)
         
         return SparseDataFrame(m, index=self.index, columns=self.columns)
+    
+    def log(self, add=1):
+        """
+        Log all data values.
+        
+        Parameters
+        ----------
+        add : float, optional
+            Defaults to adding 1 to data values to cope with zero entries
+        
+        Returns
+        -------
+        SparseDataFrame
+            A copy of the data frame with log2 values.
+        """
+        
+        # copy data
+        m = self._copy()
+        
+        # inplace add 1. Since log2(1) = 0, we can leave all non-existant
+        # i.e. zero values alone because they won't change. We need only
+        # update non-zero values in the matrix
+        np.add(m.data, add, out=m.data)
+        
+        # in place log2
+        np.log(m.data, out=m.data)
+        
+        return SparseDataFrame(m, index=self.index, columns=self.columns)
+    
+    def min(self, axis=0):
+        return self.matrix.min(axis=axis)
+    
+    
+    def max(self, axis=0):
+        return self.matrix.max(axis=axis)
         
         
 def read_sparse(prefix):
@@ -269,6 +387,8 @@ def read_sparse(prefix):
     """
     
     f = '{}.npz'.format(prefix)
+    
+    print(f)
     
     if not os.path.exists(f):
         print('There does not appear to be any data located at {}.'.format(prefix))
@@ -349,4 +469,4 @@ def read_index(f):
     finally:
         f.close()
         
-    return np.array(d)
+    return pd.Index(np.array(d))
